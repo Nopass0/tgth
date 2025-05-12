@@ -1,157 +1,138 @@
 #!/usr/bin/env python3
 """
-telegram_global_reposter_v2.py
-──────────────────────────────
-• В Saved Messages:
-    /set /status /stop /help  — управление (см. /help)
+link_bot.py  —  управляемые «ссылки» на чаты
 
-• Супер-быстрый выбор:
-    В нужном чате напишите  ...   ← три точки без пробелов
-    Бот мгновенно запоминает этот чат и стирает «...».
+• В Saved Messages (только владелец):
+    #link  Название      – начать создание ссылки
+                         → бот попросит отправить  ...  в целевом чате
+    #list                – список ссылок (№, имя, chat_id)
+    #del   №             – удалить ссылку
+• Быстрый выбор: в нужном чате (от имени бота) написать  ...
+  ─ если был активный #link – создаётся ссылка
 
-• После выбора публикует каждое новое сообщение, которое видит
-  (DM, группы, каналы), в целевом чате от вашего имени.
+• Любой юзер в DM:
+    #list                – список (№, имя) без chat_id
+    #<№>  текст          – бот публикует текст в связанном чате
 """
 
-import os, re, logging
+import os, json, re, logging
+from pathlib import Path
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.enums import MessageMediaType
 
-# ───── 1. конфигурация ──────────────────────────────────────────
+# ─────────── 1. конфиг ───────────────────────────────────────────
 load_dotenv()
 API_ID, API_HASH = int(os.getenv("API_ID")), os.getenv("API_HASH")
 PHONE            = os.getenv("PHONE")
-SESSION          = os.getenv("LOGIN", "userbot")
+SESSION          = os.getenv("LOGIN", "linkbot")
 
-CMD_PREFIX = "/"
+LINKS_FILE = Path("links.json")
 
-# ───── 2. логи ──────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-log = logging.getLogger(__name__)
+CMD_LINK  = re.compile(r"#link\s+(.+)", re.I)
+CMD_DEL   = re.compile(r"#del\s+(\d+)", re.I)
+CMD_SEND  = re.compile(r"#(\d+)\s+(.+)", re.S)
 
-# ───── 3. клиент ────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+log = logging.getLogger("linkbot")
+
+# ─────────── 2. загрузка/сохранение ссылок ──────────────────────
+def load_links():
+    if LINKS_FILE.exists():
+        with LINKS_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return []            # list[dict{id,name}]
+
+def save_links(data):
+    with LINKS_FILE.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+links = load_links()       # в памяти
+
+def add_link(chat_id: int, name: str):
+    links.append({"id": chat_id, "name": name})
+    save_links(links)
+
+def delete_link(idx: int):
+    if 0 <= idx < len(links):
+        links.pop(idx)
+        save_links(links)
+        return True
+    return False
+
+# ─────────── 3. клиент ──────────────────────────────────────────
 app = Client(SESSION, api_id=API_ID, api_hash=API_HASH, phone_number=PHONE)
 
-MY_ID: int | None             = None
-TARGET_CHAT_ID: int | None    = None
-TARGET_CHAT_TITLE: str | None = None
-CHAT_ID_RE = re.compile(r"chat\s*id\s*[:=]\s*(-?\d+)", re.I)
+MY_ID: int | None       = None
+pending_name: str | None = None    # ждём «...»
 
-# ───── 4. утилиты ───────────────────────────────────────────────
-async def me_id():
-    global MY_ID
-    if MY_ID is None:
-        MY_ID = (await app.get_me()).id
-    return MY_ID
+# ─────────── 4. фильтры ─────────────────────────────────────────
+owner_saved = filters.private & filters.chat("me")
+owner_out   = filters.me & ~filters.chat("me")      # исходящие в других чатах
 
-def chat_name(entity):
-    if getattr(entity, "title", None):
-        return entity.title
-    fn = getattr(entity, "first_name", "") or ""
-    ln = getattr(entity, "last_name", "") or ""
-    return (fn + " " + ln).strip() or "Без названия"
-
-async def msg_me(txt: str):
-    await app.send_message("me", txt)
-
-async def resolve_peer(raw: str):
-    if raw.startswith("@"): return await app.get_chat(raw)
-    if raw.lstrip("-").isdigit(): return await app.get_chat(int(raw))
-    return await app.get_chat(raw)
-
-def set_target(cid: int | None, ttl: str | None):
-    global TARGET_CHAT_ID, TARGET_CHAT_TITLE
-    TARGET_CHAT_ID, TARGET_CHAT_TITLE = cid, ttl
-
-# ───── 5. Saved Messages – команды ─────────────────────────────
-saved_filter = filters.private & filters.chat("me")
-
-@ app.on_message(saved_filter)
-async def saved_commands(_, m):
-    if m.text and m.text.startswith(CMD_PREFIX):
-        cmd, *rest = m.text.lstrip(CMD_PREFIX).split(maxsplit=1)
-        arg = rest[0] if rest else ""
-        cmd = cmd.lower()
-
-        if cmd == "help":
-            return await msg_me(
-                "/set  @chat | /set -100…  – выбрать чат\n"
-                "/status – проверить\n"
-                "/stop   – выключить\n"
-                "Быстрый способ: в нужном чате отправьте  ...  (три точки)"
-            )
-
-        if cmd == "stop":
-            set_target(None, None)
-            return await msg_me("⏹ Копирование выключено.")
-
-        if cmd == "status":
-            txt = "Копирование: " + (f"→ «{TARGET_CHAT_TITLE}»" if TARGET_CHAT_ID else "выключено")
-            return await msg_me(txt)
-
-        if cmd == "set":
-            if not arg:
-                return await msg_me("Формат: /set @chat | /set -100…")
-            try:
-                chat = await resolve_peer(arg)
-                set_target(chat.id, chat_name(chat))
-                return await msg_me(f"✅ Чат «{TARGET_CHAT_TITLE}» выбран.")
-            except Exception as e:
-                return await msg_me(f"❌ Не удалось: {e}")
-
-        return await msg_me("Неизвестная команда. /help")
-
-    # пересланное сообщение → авто-выбор
-    origin = m.forward_from_chat or m.forward_from or m.sender_chat
-    if origin:
-        set_target(origin.id, chat_name(origin))
-        return await msg_me(f"✅ Чат «{TARGET_CHAT_TITLE}» выбран.")
-
-    # chat id в тексте
+# ─────────── 5. хендлер Saved Messages ──────────────────────────
+@ app.on_message(owner_saved)
+async def owner_commands(_, m):
+    global pending_name
     if m.text:
-        mt = CHAT_ID_RE.search(m.text)
-        if mt:
-            cid = int(mt.group(1))
-            set_target(cid, f"ID {cid}")
-            return await msg_me(f"✅ Чат с ID {cid} выбран.")
+        if m.text.lower().strip() == "#list":
+            msg = "\n".join(f"{i+1}. {l['name']}  (ID {l['id']})"
+                            for i, l in enumerate(links)) or "Пусто."
+            return await m.reply(msg)
 
-    await msg_me("⚠️ Перешлите сообщение с открытым автором или /set @chat.")
+        if m.text.lower().startswith("#link"):
+            mo = CMD_LINK.match(m.text)
+            if not mo:
+                return await m.reply("Формат: #link Название")
+            pending_name = mo.group(1).strip()
+            return await m.reply("Теперь перейдите в целевой чат и отправьте `...`.")
 
-# ───── 6. Быстрый выбор через «...», пишем от себя ──────────────
-@ app.on_message(filters.me & ~saved_filter)
-async def quick_select(_, m):
-    """Если мы написали '...' в любом чате → выбрать его как цель."""
-    if m.text and m.text.strip() == "...":
-        set_target(m.chat.id, chat_name(m.chat))
-        # удалить точки, чтобы не мешали диалогу
-        try: await m.delete()
-        except: pass
-        await msg_me(f"✅ Чат «{TARGET_CHAT_TITLE}» выбран (быстрый способ).")
+        if m.text.lower().startswith("#del"):
+            mo = CMD_DEL.match(m.text)
+            if not mo: return await m.reply("Формат: #del №")
+            idx = int(mo.group(1)) - 1
+            if delete_link(idx):
+                await m.reply("✅ Удалено.")
+            else:
+                await m.reply("❌ Нет такого номера.")
+            return
 
-# ───── 7. Глобальное копирование ────────────────────────────────
-@ app.on_message(filters.incoming & ~saved_filter)
-async def global_copy(_, m):
-    if TARGET_CHAT_ID is None or m.chat.id == TARGET_CHAT_ID:
-        return
-    # игнорируем сервисные и веб-превью
-    if m.service or m.media == MessageMediaType.WEB_PAGE:
-        return
+        await m.reply("Неизвестная команда. #help")
 
-    try:
-        if m.media:
-            await m.copy(TARGET_CHAT_ID)
+# ─────────── 6. ловим «...» для создания ссылки ─────────────────
+@ app.on_message(owner_out)
+async def catch_dots(_, m):
+    global pending_name
+    if pending_name and m.text and m.text.strip() == "...":
+        add_link(m.chat.id, pending_name)
+        await m.delete(revoke=True)           # убрать «...»
+        await app.send_message("me", f"✅ Ссылка «{pending_name}» создана.")
+        pending_name = None
+
+# ─────────── 7. команды от других пользователей ─────────────────
+@ app.on_message(filters.private & ~owner_saved)
+async def user_panel(_, m):
+    if not m.text: return
+
+    if m.text.lower().strip() == "#list":
+        txt = "\n".join(f"{i+1}. {l['name']}" for i, l in enumerate(links)) or "Пусто."
+        return await m.reply(txt)
+
+    mo = CMD_SEND.match(m.text)
+    if mo:
+        idx = int(mo.group(1)) - 1
+        if 0 <= idx < len(links):
+            chat_id = links[idx]["id"]
+            text = mo.group(2).strip()
+            try:
+                await app.send_message(chat_id, text)
+                await m.reply("✅ Отправлено.")
+            except Exception as e:
+                await m.reply(f"❌ Ошибка: {e}")
         else:
-            await app.send_message(TARGET_CHAT_ID, m.text, entities=m.entities)
-    except Exception as e:
-        log.error("Ошибка копирования: %s", e)
-        await msg_me(f"❌ Ошибка копирования: {e}")
+            await m.reply("❌ Нет такого номера.")
+        return
 
-# ───── 8. старт ─────────────────────────────────────────────────
+# ─────────── 8. запуск ──────────────────────────────────────────
 if __name__ == "__main__":
-    print("Starting Telegram Global Reposter…  Ctrl-C to stop.")
+    print("Link-Bot running…  Ctrl-C to exit.")
     app.run()
