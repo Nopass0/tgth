@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "Starting Telegram User Bot..."
+echo "Starting Telegram Bot API Server..."
 
 # Check for virtual environment and activate
 if [ -d ".venv" ]; then
@@ -14,5 +14,5 @@ else
     echo "No virtual environment found. Using system Python."
 fi
 
-# Run the bot
-python3 bot.py
+# Run the API server
+python3 api_server.py

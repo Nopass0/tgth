@@ -33,6 +33,7 @@ A Telegram user bot built with Pyrogram that allows you to send messages from yo
    ```
    ./scripts/setup_linux.sh
    ```
+   This will create a `.venv` virtual environment and install all dependencies.
 4. Edit the `.env` file to update your configuration if needed.
 
 ## Running the Bot
@@ -46,6 +47,44 @@ scripts\run_windows.bat
 ```
 ./scripts/run_linux.sh
 ```
+
+## API Server
+
+The project includes an API server that allows sending messages and getting chat lists via HTTP endpoints.
+
+### Running the API Server
+
+#### Windows
+```
+scripts\run_api_windows.bat
+```
+
+#### Linux
+```
+./scripts/run_api_linux.sh
+```
+
+### API Endpoints
+
+- `GET /chats` - Get a list of all available chats
+- `POST /send` - Send a message to a specific chat
+
+All requests require authentication using the API key, which is automatically generated on first run and stored in the `.api_key` file.
+
+Example usage:
+
+```bash
+# Get chat list
+curl -X GET "http://localhost:8000/chats" -H "X-API-Key: your_api_key"
+
+# Send a message
+curl -X POST "http://localhost:8000/send" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your_api_key" \
+  -d '{"chat_id": -1002676859349, "text": "Hello from API!"}'
+```
+
+The API server also provides Swagger documentation at `/docs` endpoint.
 
 ## Configuration
 

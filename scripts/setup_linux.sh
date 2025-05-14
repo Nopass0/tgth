@@ -18,14 +18,14 @@ if ! command -v uv &> /dev/null; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# Create and activate a virtual environment
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv venv
+# Create virtual environment if it doesn't exist
+if [ ! -d ".venv" ]; then
+    echo "Creating virtual environment with uv..."
+    uv venv
 fi
 
 # Activate virtual environment
-source venv/bin/activate
+source .venv/bin/activate
 
 # Install dependencies with uv
 echo "Installing dependencies..."
@@ -34,8 +34,10 @@ uv pip install -r requirements.txt
 echo ""
 echo "Setup completed successfully!"
 echo ""
-echo "To run the bot, use: bash scripts/run_linux.sh"
+echo "To run the bot, use: ./scripts/run_linux.sh"
+echo "To run the API server, use: ./scripts/run_api_linux.sh"
 echo ""
 
-# Make the run script executable
+# Make the run scripts executable
 chmod +x scripts/run_linux.sh 2>/dev/null || true
+chmod +x scripts/run_api_linux.sh 2>/dev/null || true
