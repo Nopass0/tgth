@@ -60,6 +60,106 @@ message_history = {}
 # Structure: {chat_id: {message_id: timestamp}}
 processed_message_ids = {}
 
+# Command regexes for bot functionality
+CMD_LINK = re.compile(r"#link\s+(.+)", re.I)
+CMD_DEL = re.compile(r"#del\s+(\d+)", re.I)
+CMD_SEND = re.compile(r"#(\d+)\s+(.+)", re.S)
+
+# Bot state
+MY_ID = None
+pending_name = None  # For link creation
+
+# Background task to handle bot commands in messages
+async def handle_bot_messages():
+    """Background task to handle bot commands in Saved Messages"""
+    print("Starting bot message handling...")
+
+    # Set polling interval (in seconds)
+    polling_interval = 3
+
+    global pending_name, MY_ID
+
+    while True:
+        try:
+            if client.is_connected and MY_ID:
+                # Process messages in Saved Messages (from self)
+                async for message in client.get_chat_history("me", limit=10):
+                    # Skip already processed messages
+                    if message.chat.id in processed_message_ids and message.id in processed_message_ids[message.chat.id]:
+                        continue
+
+                    # Track this message as processed
+                    if message.chat.id not in processed_message_ids:
+                        processed_message_ids[message.chat.id] = {}
+                    processed_message_ids[message.chat.id][message.id] = time.time()
+
+                    # Process only text messages
+                    if message.text:
+                        # Process #list command
+                        if message.text.lower().strip() == "#list":
+                            links = load_links()
+                            msg = "\n".join(f"{i+1}. {l['name']}  (ID {l['id']})"
+                                           for i, l in enumerate(links)) or "No links found."
+                            await client.send_message("me", msg)
+                            continue
+
+                        # Process #link command
+                        if message.text.lower().startswith("#link"):
+                            match = CMD_LINK.match(message.text)
+                            if match:
+                                pending_name = match.group(1).strip()
+                                await client.send_message("me", "Now go to the target chat and send `...`")
+                            else:
+                                await client.send_message("me", "Format: #link Name")
+                            continue
+
+                        # Process #del command
+                        if message.text.lower().startswith("#del"):
+                            match = CMD_DEL.match(message.text)
+                            if match:
+                                idx = int(match.group(1)) - 1
+                                if delete_link(idx):
+                                    await client.send_message("me", "✅ Link deleted.")
+                                else:
+                                    await client.send_message("me", "❌ No such link number.")
+                            else:
+                                await client.send_message("me", "Format: #del Number")
+                            continue
+
+                # Check other chats for "..." to create links
+                if pending_name:
+                    for dialog in await client.get_dialogs(limit=50):
+                        chat = dialog.chat
+                        # Skip Saved Messages
+                        if chat.id == MY_ID:
+                            continue
+
+                        # Check recent messages in this chat
+                        async for msg in client.get_chat_history(chat.id, limit=5):
+                            # Skip messages from others
+                            if msg.from_user and msg.from_user.id != MY_ID:
+                                continue
+
+                            # Check for "..." message
+                            if msg.text and msg.text.strip() == "...":
+                                # Create the link
+                                add_link(chat.id, pending_name)
+
+                                # Delete the "..." message
+                                await client.delete_messages(chat.id, msg.id)
+
+                                # Notify in Saved Messages
+                                await client.send_message("me", f"✅ Link '{pending_name}' created.")
+
+                                # Reset pending_name
+                                pending_name = None
+                                break
+        except Exception as e:
+            print(f"Error in message handler: {e}")
+
+        # Wait before next check
+        await asyncio.sleep(polling_interval)
+
 # Background monitoring task
 async def monitor_linked_chats():
     """Background task to monitor linked chats for new messages"""
@@ -122,14 +222,25 @@ async def lifespan(app: FastAPI):
     # Startup: initialize the Telegram client
     print("Starting Telegram client...")
     monitoring_task = None
+    message_handler_task = None
+    global MY_ID
 
     try:
         await client.start()
         print("Telegram client started successfully")
 
+        # Get our user ID
+        me = await client.get_me()
+        MY_ID = me.id
+        print(f"Bot user ID: {MY_ID}")
+
         # Start background monitoring task
         monitoring_task = asyncio.create_task(monitor_linked_chats())
         print("Background monitoring task started")
+
+        # Start message handler task
+        message_handler_task = asyncio.create_task(handle_bot_messages())
+        print("Message handler task started")
 
     except Exception as e:
         print(f"Error starting Telegram client: {e}")
@@ -147,6 +258,14 @@ async def lifespan(app: FastAPI):
             await monitoring_task
         except asyncio.CancelledError:
             print("Monitoring task cancelled")
+
+    # Cancel message handler task if running
+    if message_handler_task:
+        message_handler_task.cancel()
+        try:
+            await message_handler_task
+        except asyncio.CancelledError:
+            print("Message handler task cancelled")
 
     if client.is_connected:
         await client.stop()
@@ -220,6 +339,17 @@ class Message(BaseModel):
     chat_id: int
     text: str
 
+class LinkMessage(BaseModel):
+    link_number: int
+    text: str
+
+class LinkCreate(BaseModel):
+    chat_id: int
+    name: str
+
+class LinkDeleteRequest(BaseModel):
+    link_number: int
+
 class MessageResponse(BaseModel):
     success: bool
     message: str
@@ -243,6 +373,24 @@ def load_links():
         with LINKS_FILE.open("r", encoding="utf-8") as f:
             return json.load(f)
     return []
+
+def save_links(data):
+    with LINKS_FILE.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def add_link(chat_id: int, name: str):
+    links = load_links()
+    links.append({"id": chat_id, "name": name})
+    save_links(links)
+    return True
+
+def delete_link(idx: int):
+    links = load_links()
+    if 0 <= idx < len(links):
+        links.pop(idx)
+        save_links(links)
+        return True
+    return False
 
 def parse_cabinet_message(chat_id, text, timestamp, chat_name="", message_id=None):
     """Parse cabinet message and store in message history"""
@@ -325,6 +473,66 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
 @app.get("/", tags=["Status"])
 async def root():
     return {"status": "running", "message": "Telegram Bot API is running"}
+
+@app.get("/links", response_model=ChatList, tags=["Links"])
+async def get_links(api_key: APIKey = Depends(get_api_key)):
+    """
+    Get all available links.
+
+    Returns:
+        List of all links with their ids and names
+    """
+    links = load_links()
+    return ChatList(chats=[ChatLink(id=link["id"], name=link["name"]) for link in links])
+
+@app.post("/links", response_model=MessageResponse, tags=["Links"])
+async def create_link(link: LinkCreate, api_key: APIKey = Depends(get_api_key)):
+    """
+    Create a new link to a chat.
+
+    Args:
+        chat_id: The ID of the chat to link
+        name: The name/label for this link
+
+    Returns:
+        Success status and message
+    """
+    try:
+        # Add the link
+        add_link(link.chat_id, link.name)
+        return MessageResponse(
+            success=True,
+            message=f"Link '{link.name}' created for chat {link.chat_id}"
+        )
+    except Exception as e:
+        print(f"Error creating link: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create link: {str(e)}"
+        )
+
+@app.delete("/links", response_model=MessageResponse, tags=["Links"])
+async def delete_link_endpoint(request: LinkDeleteRequest, api_key: APIKey = Depends(get_api_key)):
+    """
+    Delete a link by its number.
+
+    Args:
+        link_number: The number of the link to delete (as shown in the list)
+
+    Returns:
+        Success status and message
+    """
+    link_idx = request.link_number - 1
+    if delete_link(link_idx):
+        return MessageResponse(
+            success=True,
+            message=f"Link #{request.link_number} deleted successfully"
+        )
+    else:
+        return MessageResponse(
+            success=False,
+            message=f"No link found with number {request.link_number}"
+        )
 
 @app.get("/chats", response_model=ChatList, tags=["Chats"])
 async def get_chats(api_key: APIKey = Depends(get_api_key)):
@@ -561,6 +769,52 @@ async def get_recent_messages(hours: int = 3, cabinet_name: str = None, api_key:
 
     return CabinetMessageList(messages=recent_messages)
 
+@app.post("/send-to-link", response_model=MessageResponse, tags=["Messages"])
+async def send_to_link(message: LinkMessage, api_key: APIKey = Depends(get_api_key)):
+    """
+    Send a message to a linked chat by its number.
+
+    Args:
+        link_number: The number of the link (as shown in #list command)
+        text: The message to send
+
+    Returns:
+        Success status and message
+    """
+    try:
+        # Check if client is initialized
+        if not client.is_connected:
+            await client.start()
+
+        # Get links
+        links = load_links()
+        link_idx = message.link_number - 1
+
+        # Check if link exists
+        if not (0 <= link_idx < len(links)):
+            return MessageResponse(
+                success=False,
+                message=f"No link found with number {message.link_number}"
+            )
+
+        # Get chat ID
+        chat_id = links[link_idx]["id"]
+        link_name = links[link_idx]["name"]
+
+        # Send message
+        await client.send_message(chat_id, message.text)
+
+        return MessageResponse(
+            success=True,
+            message=f"Message sent to {link_name} (link #{message.link_number})"
+        )
+    except Exception as e:
+        print(f"Error sending message to link: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to send message to link: {str(e)}"
+        )
+
 @app.get("/messages/all", response_model=CabinetMessageList, tags=["Messages"])
 async def get_all_messages(cabinet_name: str = None, api_key: APIKey = Depends(get_api_key)):
     """
@@ -631,10 +885,14 @@ if __name__ == "__main__":
     print(f" Local URL: http://{local_ip}:{port}")
     print(f" API Key: {api_key}")
     print(f" Endpoints:")
-    print(f"   - GET  /chats - List all available chats")
-    print(f"   - POST /send  - Send a message to a chat")
-    print(f"   - GET  /messages/recent - Get cabinet messages from last 3 hours")
-    print(f"   - GET  /messages/all - Get all cabinet messages")
+    print(f"   - GET    /chats - List all available chats")
+    print(f"   - POST   /send  - Send a message to a chat")
+    print(f"   - GET    /links - List all links")
+    print(f"   - POST   /links - Create a new link to a chat")
+    print(f"   - DELETE /links - Delete a link")
+    print(f"   - POST   /send-to-link - Send a message to a linked chat by number")
+    print(f"   - GET    /messages/recent - Get cabinet messages from last 3 hours")
+    print(f"   - GET    /messages/all - Get all cabinet messages")
     print(f" API Documentation: http://{local_ip}:{port}/docs")
     print(f"{'='*50}\n")
     
