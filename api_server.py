@@ -581,22 +581,17 @@ async def send_message(
 
     # Process with a timeout to avoid 504 Gateway Timeout errors
     async def process_with_timeout():
-        try:
-            # Check if client is initialized
-            if not client.is_connected:
-                await client.start()
+        # Check if client is initialized
+        if not client.is_connected:
+            await client.start()
 
         # Send message
         sent_message = await client.send_message(message.chat_id, message.text)
 
-        # Wait for reply message (wait up to 10 seconds but with a shorter timeout to avoid 504 errors)
+        # Wait for reply message (shorter wait time to avoid 504 errors)
         print(f"Waiting for response to message: {message.text[:30]}...")
-        # Use asyncio.wait_for to add a timeout
-        try:
-            await asyncio.sleep(10)
-        except asyncio.TimeoutError:
-            print("Timeout waiting for response, continuing anyway")
-            # Continue processing even if timeout occurs
+        # Wait 5 seconds - no need for timeout here as the whole function has a timeout
+        await asyncio.sleep(5)
 
         # Safely get response message
         response_message = None
