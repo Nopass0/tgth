@@ -126,34 +126,56 @@ async def handle_bot_messages():
                                 await client.send_message("me", "Format: #del Number")
                             continue
 
-                # Check other chats for "..." to create links
+                # Check for "..." messages to create links
                 if pending_name:
-                    for dialog in await client.get_dialogs(limit=50):
+                    # Get all chats
+                    dialogs = []
+                    async for dialog in client.get_dialogs():
+                        dialogs.append(dialog)
+
+                    # Check recent messages in all chats except Saved Messages
+                    for dialog in dialogs:
                         chat = dialog.chat
+
                         # Skip Saved Messages
-                        if chat.id == MY_ID:
+                        if getattr(chat, "id", 0) == MY_ID:
                             continue
 
-                        # Check recent messages in this chat
-                        async for msg in client.get_chat_history(chat.id, limit=5):
-                            # Skip messages from others
-                            if msg.from_user and msg.from_user.id != MY_ID:
-                                continue
+                        # Get recent messages
+                        chat_messages = []
+                        try:
+                            async for msg in client.get_chat_history(chat.id, limit=20):
+                                # Only check messages from ourselves
+                                if msg.from_user and msg.from_user.id == MY_ID:
+                                    chat_messages.append(msg)
 
-                            # Check for "..." message
-                            if msg.text and msg.text.strip() == "...":
-                                # Create the link
-                                add_link(chat.id, pending_name)
+                            # Find and process "..." messages
+                            for msg in chat_messages:
+                                if msg.text and msg.text.strip() == "...":
+                                    print(f"Found '...' message in chat {chat.title or chat.first_name or chat.id}")
 
-                                # Delete the "..." message
-                                await client.delete_messages(chat.id, msg.id)
+                                    # Create the link
+                                    add_link(chat.id, pending_name)
 
-                                # Notify in Saved Messages
-                                await client.send_message("me", f"✅ Link '{pending_name}' created.")
+                                    # Delete the "..." message
+                                    try:
+                                        await client.delete_messages(chat.id, msg.id)
+                                        print(f"Deleted '...' message with ID {msg.id}")
+                                    except Exception as e:
+                                        print(f"Failed to delete message: {e}")
 
-                                # Reset pending_name
-                                pending_name = None
+                                    # Notify in Saved Messages
+                                    await client.send_message("me", f"✅ Link '{pending_name}' created for chat '{chat.title or chat.first_name or chat.id}'")
+
+                                    # Reset pending_name
+                                    pending_name = None
+                                    break
+
+                            if pending_name is None:
                                 break
+                        except Exception as e:
+                            print(f"Error checking chat {getattr(chat, 'id', 'unknown')}: {e}")
+                            continue
         except Exception as e:
             print(f"Error in message handler: {e}")
 
