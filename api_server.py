@@ -995,8 +995,8 @@ if __name__ == "__main__":
     print(f" API Documentation: http://{local_ip}:{port}/docs")
     print(f"{'='*50}\n")
     
-    # Create a Config object to set timeout options
-    config = uvicorn.Config(
+    # Start the server with auto-restart on failure
+    uvicorn.run(
         "api_server:app",
         host="0.0.0.0",  # Bind to all interfaces
         port=port,
@@ -1005,11 +1005,5 @@ if __name__ == "__main__":
         access_log=True,
         proxy_headers=True,  # Trust proxy headers for proper IP handling
         timeout_keep_alive=120,  # Increase keep-alive timeout
-        timeout_graceful_shutdown=10,  # Graceful shutdown timeout
-        limit_concurrency=100,  # Limit concurrent connections
-        limit_max_requests=0  # No limit on max requests
+        limit_concurrency=100  # Limit concurrent connections
     )
-
-    # Start the server with the config
-    server = uvicorn.Server(config)
-    await server.serve()
