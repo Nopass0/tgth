@@ -340,13 +340,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS
+# Configure CORS - allow all origins and methods
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],  # Allow all origins including http and https
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers
+    max_age=86400,  # Cache preflight requests for 24 hours
 )
 
 # Models
@@ -874,9 +876,15 @@ async def get_all_messages(cabinet_name: str = None, api_key: APIKey = Depends(g
 async def log_requests(request: Request, call_next):
     # Log request
     print(f"Request: {request.method} {request.url}")
+    print(f"Origin: {request.headers.get('origin')}")
 
     # Process request
     response = await call_next(request)
+
+    # Add headers to every response for CORS
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization"
 
     # Return response
     return response
@@ -921,8 +929,10 @@ if __name__ == "__main__":
     # Start the server with auto-restart on failure
     uvicorn.run(
         "api_server:app",
-        host="0.0.0.0",
+        host="0.0.0.0",  # Bind to all interfaces
         port=port,
         reload=True,
-        log_level="info"
+        log_level="info",
+        access_log=True,
+        proxy_headers=True  # Trust proxy headers for proper IP handling
     )
