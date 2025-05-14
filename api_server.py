@@ -587,9 +587,9 @@ async def send_message(
         # Send message
         sent_message = await client.send_message(message.chat_id, message.text)
 
-        # Wait for reply message (wait 10 seconds to ensure we get the response)
+        # Wait for reply message (wait 15 seconds to ensure we get the response)
         print(f"Waiting for response to message: {message.text[:30]}...")
-        await asyncio.sleep(10)
+        await asyncio.sleep(15)
 
         # Safely get response message
         response_message = None
@@ -602,7 +602,7 @@ async def send_message(
             new_messages = []
             async for msg in client.get_chat_history(
                 message.chat_id,
-                limit=10  # Get more messages to ensure we capture the response
+                limit=20  # Get more messages to ensure we capture the response
             ):
                 new_messages.append(msg)
 
@@ -616,22 +616,42 @@ async def send_message(
             # Log all recent messages for debugging
             print(f"Found {len(new_messages)} recent messages in chat")
 
-            # Filter messages to only include those sent AFTER our message
-            sent_date = sent_message.date
-            print(f"Our message sent at: {sent_date}")
-
-            # Sort messages by date (newest first is default from Pyrogram)
-            filtered_messages = []
+            # First check for messages explicitly containing payment confirmation
+            payment_messages = []
             for msg in new_messages:
-                if msg.id != sent_message.id:  # Skip our own message
-                    print(f"Message: ID={msg.id}, Date={msg.date}, Text={msg.text[:30]}...")
-                    if msg.date > sent_date:
-                        print(f"  ✓ Message is newer than our sent message")
-                        filtered_messages.append(msg)
-                    else:
-                        print(f"  ✗ Message is older than our sent message - ignoring")
+                if msg.text and "Выплата добавлена в очередь" in msg.text:
+                    print(f"Found payment confirmation message: {msg.text[:50]}...")
+                    payment_messages.append(msg)
 
-            print(f"Found {len(filtered_messages)} messages after our sent message")
+            if payment_messages:
+                # Sort payment messages by date (newest first)
+                payment_messages.sort(key=lambda m: m.date, reverse=True)
+                filtered_messages = payment_messages
+                print(f"Found {len(filtered_messages)} payment confirmation messages")
+            else:
+                # If no payment messages, use normal time-based filtering
+                # Filter messages to only include those sent AFTER our message
+                sent_date = sent_message.date
+                print(f"Our message sent at: {sent_date}")
+
+                # Sort messages by date (newest first is default from Pyrogram)
+                filtered_messages = []
+                for msg in new_messages:
+                    if msg.id != sent_message.id:  # Skip our own message
+                        print(f"Message: ID={msg.id}, Date={msg.date}, Text={msg.text[:30] if msg.text else 'No text'}...")
+                        if msg.date >= sent_date:  # Use >= instead of > to catch messages sent at the same time
+                            print(f"  ✓ Message is newer than or equal to our sent message")
+                            filtered_messages.append(msg)
+                        else:
+                            print(f"  ✗ Message is older than our sent message - ignoring")
+
+                print(f"Found {len(filtered_messages)} messages after our sent message")
+
+                # If we didn't find any messages, we might need to check all messages as a fallback
+                if not filtered_messages:
+                    print("No filtered messages found. Checking all messages as fallback.")
+                    filtered_messages = [m for m in new_messages if m.id != sent_message.id]
+                    print(f"Using all {len(filtered_messages)} messages as fallback")
 
             # First try to find messages with payment confirmation text
             for msg in filtered_messages:
@@ -674,18 +694,29 @@ async def send_message(
         response_text = "No response received - payment likely failed"
         auto_withdraw = None
 
+        # Print all filtered messages for debugging
+        print(f"Filtered messages count: {len(filtered_messages)}")
+        for i, msg in enumerate(filtered_messages):
+            if msg.text:
+                print(f"Filtered message {i}: {msg.text[:100]}...")
+
         if response_message:
             text = response_message.text
 
             # Log the actual message for debugging
             print(f"Analyzing response message: {text}")
 
+            # Output the entire message for debugging
+            print("FULL RESPONSE MESSAGE:")
+            print(text)
+            print("END OF MESSAGE")
+
             # Check for error messages
             if "Exception: params count" in text:
                 success = False
                 response_text = "Failed: Exception params count error"
 
-            # Check for success message with transaction details - must match exactly
+            # Check for success message with transaction details
             elif "Выплата добавлена в очередь" in text:
                 success = True
                 response_text = "Payment successfully queued"
@@ -727,22 +758,46 @@ async def send_message(
                                 print(f"Removed old transaction {tx_id} from cache")
 
                 # Parse auto withdraw status (case insensitive)
-                if "автовывод: да" in text.lower():
-                    auto_withdraw = True
-                    print("Auto-withdraw: YES")
-                elif "автовывод: нет" in text.lower():
-                    auto_withdraw = False
-                    print("Auto-withdraw: NO")
+                # Check for "Автовывод: ДА" or "Автовывод: НЕТ" with more flexibility
+                auto_withdraw_match = re.search(r'(?i)автовывод\s*:\s*(да|нет)', text)
+                if auto_withdraw_match:
+                    status_text = auto_withdraw_match.group(1).lower()
+                    if status_text == "да":
+                        auto_withdraw = True
+                        print("Auto-withdraw: YES")
+                    elif status_text == "нет":
+                        auto_withdraw = False
+                        print("Auto-withdraw: NO")
                 else:
                     print("Auto-withdraw status not found in response")
             else:
-                # Any other response is treated as failure
-                success = False
-                response_text = "Unexpected response format"
+                # Do a secondary check for Exception messages anywhere in the text
+                if any(error_msg in text for error_msg in ["Exception:", "Error:", "ошибка", "Ошибка"]):
+                    success = False
+                    response_text = f"Error detected: {text[:100]}..."
+                    print(f"Error message detected: {text[:100]}...")
+                else:
+                    # Any other response is treated as unclear
+                    success = False
+                    response_text = "Unexpected response format"
+                    print(f"Unexpected response format: {text[:100]}...")
         else:
-            # No response message received
-            success = False
-            response_text = "No response received - payment likely failed"
+            # Debug: check all messages one more time
+            print("No response message identified. Re-checking all messages:")
+            for msg in new_messages:
+                if msg.text:
+                    if "Выплата добавлена в очередь" in msg.text:
+                        print(f"Found payment confirmation: {msg.text[:50]}...")
+                        response_message = msg
+                        success = True
+                        response_text = "Payment successfully queued"
+
+                        # Extract auto-withdraw status
+                        if "автовывод: да" in msg.text.lower():
+                            auto_withdraw = True
+                        elif "автовывод: нет" in msg.text.lower():
+                            auto_withdraw = False
+                        break
 
         return MessageResponse(
             success=success,
