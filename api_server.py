@@ -576,20 +576,27 @@ async def send_message(
       - message: Status message with details
       - auto_withdraw: For payment messages, indicates if auto-withdraw is enabled (true/false/null)
     """
-    try:
-        # Check if client is initialized
-        if not client.is_connected:
-            await client.start()
+    # Import asyncio
+    import asyncio
 
-        # Import asyncio
-        import asyncio
+    # Process with a timeout to avoid 504 Gateway Timeout errors
+    async def process_with_timeout():
+        try:
+            # Check if client is initialized
+            if not client.is_connected:
+                await client.start()
 
         # Send message
         sent_message = await client.send_message(message.chat_id, message.text)
 
-        # Wait for reply message (wait 15 seconds to ensure we get the response)
+        # Wait for reply message (wait up to 10 seconds but with a shorter timeout to avoid 504 errors)
         print(f"Waiting for response to message: {message.text[:30]}...")
-        await asyncio.sleep(15)
+        # Use asyncio.wait_for to add a timeout
+        try:
+            await asyncio.sleep(10)
+        except asyncio.TimeoutError:
+            print("Timeout waiting for response, continuing anyway")
+            # Continue processing even if timeout occurs
 
         # Safely get response message
         response_message = None
@@ -804,6 +811,18 @@ async def send_message(
             message=response_text,
             auto_withdraw=auto_withdraw
         )
+
+    # Run with a timeout to prevent 504 Gateway Timeout errors
+    try:
+        # 20 second timeout for the entire process
+        return await asyncio.wait_for(process_with_timeout(), timeout=20)
+    except asyncio.TimeoutError:
+        print("Processing timed out, returning default response")
+        return MessageResponse(
+            success=False,
+            message="Processing timed out - message was sent but response couldn't be analyzed",
+            auto_withdraw=None
+        )
     except Exception as e:
         print(f"Error in send_message endpoint: {str(e)}")
         raise HTTPException(
@@ -981,13 +1000,21 @@ if __name__ == "__main__":
     print(f" API Documentation: http://{local_ip}:{port}/docs")
     print(f"{'='*50}\n")
     
-    # Start the server with auto-restart on failure
-    uvicorn.run(
+    # Create a Config object to set timeout options
+    config = uvicorn.Config(
         "api_server:app",
         host="0.0.0.0",  # Bind to all interfaces
         port=port,
         reload=True,
         log_level="info",
         access_log=True,
-        proxy_headers=True  # Trust proxy headers for proper IP handling
+        proxy_headers=True,  # Trust proxy headers for proper IP handling
+        timeout_keep_alive=120,  # Increase keep-alive timeout
+        timeout_graceful_shutdown=10,  # Graceful shutdown timeout
+        limit_concurrency=100,  # Limit concurrent connections
+        limit_max_requests=0  # No limit on max requests
     )
+
+    # Start the server with the config
+    server = uvicorn.Server(config)
+    await server.serve()
