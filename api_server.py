@@ -56,6 +56,10 @@ transaction_cache = {}
 # Structure: {chat_id: [{"cabinet_name": str, "cabinet_id": str, "message": str, "timestamp": float, "message_id": int}]}
 message_history = {}
 
+# Cancellation message storage
+# Structure: {chat_id: [{"message": str, "timestamp": float, "message_id": int}]}
+cancellation_messages = {}
+
 # Set to track processed message IDs to avoid duplicates
 # Structure: {chat_id: {message_id: timestamp}}
 processed_message_ids = {}
@@ -207,24 +211,36 @@ async def monitor_linked_chats():
                         try:
                             # Get recent messages from this chat
                             messages = []
-                            async for msg in client.get_chat_history(chat_id, limit=5):
+                            async for msg in client.get_chat_history(chat_id, limit=10):
                                 messages.append(msg)
 
-                                # Check for cabinet messages
-                                if msg.text and "[" in msg.text and "]" in msg.text and ":" in msg.text:
+                                if msg.text:
                                     # Convert Pyrogram date to timestamp
                                     timestamp = msg.date.timestamp() if hasattr(msg.date, "timestamp") else time.time()
 
-                                    # Parse and store cabinet message with message ID
-                                    parsed = parse_cabinet_message(
+                                    # Check for cabinet messages
+                                    if "[" in msg.text and "]" in msg.text and ":" in msg.text:
+                                        # Parse and store cabinet message with message ID
+                                        parsed = parse_cabinet_message(
+                                            chat_id,
+                                            msg.text,
+                                            timestamp,
+                                            chat_name,
+                                            message_id=msg.id
+                                        )
+                                        if parsed:
+                                            print(f"Found cabinet message in chat {chat_name} (ID: {msg.id})")
+
+                                    # Check for cancellation messages containing "невозможно обработать"
+                                    cancellation = process_cancellation_message(
                                         chat_id,
                                         msg.text,
                                         timestamp,
                                         chat_name,
                                         message_id=msg.id
                                     )
-                                    if parsed:
-                                        print(f"Found cabinet message in chat {chat_name} (ID: {msg.id})")
+                                    if cancellation:
+                                        print(f"Found cancellation message in chat {chat_name} (ID: {msg.id})")
 
                         except Exception as e:
                             print(f"Error checking chat {chat_id} ({chat_name}): {e}")
@@ -391,6 +407,16 @@ class CabinetMessage(BaseModel):
 class CabinetMessageList(BaseModel):
     messages: List[CabinetMessage]
 
+class CancellationMessage(BaseModel):
+    chat_id: int
+    chat_name: str
+    message: str
+    timestamp: float
+    message_id: Optional[int] = None
+
+class CancellationMessageList(BaseModel):
+    messages: List[CancellationMessage]
+
 # Helper functions
 def load_links():
     if LINKS_FILE.exists():
@@ -480,6 +506,51 @@ def parse_cabinet_message(chat_id, text, timestamp, chat_name="", message_id=Non
             for msg_id in list(processed_message_ids[chat].keys()):
                 if current_time - processed_message_ids[chat][msg_id] > 86400:  # 24 hours
                     del processed_message_ids[chat][msg_id]
+
+        return message_entry
+
+    return None
+
+def process_cancellation_message(chat_id, text, timestamp, chat_name="", message_id=None):
+    """Process and store cancellation messages containing 'невозможно обработать'"""
+    # Case-insensitive pattern matching for "невозможно обработать"
+    cancellation_pattern = re.compile(r"невозможно\s+обработать", re.IGNORECASE)
+
+    # Check if the message contains the pattern
+    if cancellation_pattern.search(text):
+        print(f"Found cancellation message: '{text[:50]}...'")
+
+        # Check if this message ID has already been processed
+        if message_id is not None:
+            # Initialize chat in processed IDs if not exists
+            if chat_id not in processed_message_ids:
+                processed_message_ids[chat_id] = {}
+
+            # If this message ID is already in our processed set, skip it
+            if message_id in processed_message_ids[chat_id]:
+                print(f"Skipping already processed cancellation message ID {message_id}")
+                return None
+
+            # Add to processed messages
+            processed_message_ids[chat_id][message_id] = timestamp
+
+        # Create message entry
+        message_entry = {
+            "message": text,
+            "timestamp": timestamp,
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "message_id": message_id
+        }
+
+        # Initialize chat in cancellation messages if not exists
+        if chat_id not in cancellation_messages:
+            cancellation_messages[chat_id] = []
+
+        # Add message to cancellation messages
+        cancellation_messages[chat_id].append(message_entry)
+
+        print(f"Added cancellation message from {chat_name}: {text[:30]}...")
 
         return message_entry
 
@@ -941,6 +1012,66 @@ async def get_all_messages(cabinet_name: str = None, api_key: APIKey = Depends(g
 
     return CabinetMessageList(messages=all_messages)
 
+@app.get("/cancellations/recent", response_model=CancellationMessageList, tags=["Cancellations"])
+async def get_recent_cancellations(hours: int = 24, api_key: APIKey = Depends(get_api_key)):
+    """
+    Get cancellation messages (containing "невозможно обработать") from all linked chats
+    from the last specified hours.
+
+    Args:
+        hours: Number of hours to look back (default: 24)
+
+    Returns:
+        List of cancellation messages from the specified time period
+    """
+    recent_messages = []
+    current_time = time.time()
+    time_limit = current_time - (hours * 3600)  # Convert hours to seconds
+
+    # Collect messages from all chats
+    for chat_id, messages in cancellation_messages.items():
+        for msg in messages:
+            # Filter by timestamp
+            if msg["timestamp"] >= time_limit:
+                recent_messages.append(CancellationMessage(
+                    chat_id=chat_id,
+                    chat_name=msg["chat_name"],
+                    message=msg["message"],
+                    timestamp=msg["timestamp"],
+                    message_id=msg["message_id"]  # Include the message ID
+                ))
+
+    # Sort by timestamp (newest first)
+    recent_messages.sort(key=lambda x: x.timestamp, reverse=True)
+
+    return CancellationMessageList(messages=recent_messages)
+
+@app.get("/cancellations/all", response_model=CancellationMessageList, tags=["Cancellations"])
+async def get_all_cancellations(api_key: APIKey = Depends(get_api_key)):
+    """
+    Get all cancellation messages (containing "невозможно обработать") from all linked chats.
+
+    Returns:
+        List of all cancellation messages
+    """
+    all_messages = []
+
+    # Collect messages from all chats
+    for chat_id, messages in cancellation_messages.items():
+        for msg in messages:
+            all_messages.append(CancellationMessage(
+                chat_id=chat_id,
+                chat_name=msg["chat_name"],
+                message=msg["message"],
+                timestamp=msg["timestamp"],
+                message_id=msg["message_id"]  # Include the message ID
+            ))
+
+    # Sort by timestamp (newest first)
+    all_messages.sort(key=lambda x: x.timestamp, reverse=True)
+
+    return CancellationMessageList(messages=all_messages)
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     # Log request
@@ -992,6 +1123,8 @@ if __name__ == "__main__":
     print(f"   - POST   /send-to-link - Send a message to a linked chat by number")
     print(f"   - GET    /messages/recent - Get cabinet messages from last 3 hours")
     print(f"   - GET    /messages/all - Get all cabinet messages")
+    print(f"   - GET    /cancellations/recent - Get cancellation messages from last 24 hours")
+    print(f"   - GET    /cancellations/all - Get all cancellation messages")
     print(f" API Documentation: http://{local_ip}:{port}/docs")
     print(f"{'='*50}\n")
     
